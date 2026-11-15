@@ -1,0 +1,826 @@
+{
+  "name": "WF1 - Stock Sync, Order Intake dan Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WF1 - Jalur A: Sinkron Stok 15 Menit\n\nAlur: Jadwal -> (ambil daftar merchant + ambil katalog, paralel) -> GET stok per merchant (Retry On Fail, onError continueErrorOutput) -> sukses: normalisasi -> gabung katalog by sku -> ambil qty lama -> upsert idempotent. Gagal permanen: dead-letter + alert.\n\n**Periksa ulang setelah import:**\n- Node **Gabungkan Katalog** (Merge, combine by field `sku`): skema parameter Merge beda-beda antar versi n8n, buka node ini di editor dan pastikan mode = Combine > field `sku` = `sku`, Keep Matches.\n- `new_stockouts` di `ops.sync_runs` dihitung sebagai jumlah baris qty=0 pada batch sinkron ini (pendekatan), bukan transisi tepat dari >0 ke 0. Dokumentasikan penyederhanaan ini di docs/02.\n- Ambang \"Terlalu Lambat?\" (60000 ms) sengaja longgar; turunkan sementara untuk menguji alert (lihat guide/wf5).\n\n**TODO:**\n- [ ] Pilih credential Postgres `ops_writer` dan Header Auth Mock API di tiap node\n- [ ] Ganti `ISI_TOKEN_PUSH_KUMA` dengan token monitor Push kalian\n- [ ] Set Settings > Error Workflow = WF5 di workflow ini",
+        "height": 480,
+        "width": 620
+      },
+      "id": "sa-sticky",
+      "name": "Sticky Note Jalur A",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1400, -820]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "*/15 * * * *" }
+          ]
+        }
+      },
+      "id": "a1-jadwal-sinkron",
+      "name": "Jadwal Sinkron 15 Menit",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1400, -300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nsd.sync_start = Date.now();\nreturn [{ json: { sync_start: sd.sync_start } }];"
+      },
+      "id": "a1b-catat-waktu-mulai",
+      "name": "Catat Waktu Mulai",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1180, -300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT merchant_id FROM core.merchants WHERE active = true ORDER BY merchant_id;"
+      },
+      "id": "a2-ambil-daftar-merchant",
+      "name": "Ambil Daftar Merchant",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-960, -300],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT product_id, sku, price FROM core.products;"
+      },
+      "id": "a9-ambil-katalog-produk",
+      "name": "Ambil Katalog Produk",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-960, -480],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'http://mock-api:8080/merchants/' + $json.merchant_id + '/stock' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "retry": { "retryOnFail": true, "maxTries": 4, "waitBetweenTries": 1000 }
+        }
+      },
+      "id": "a3h-ambil-stok-merchant-api",
+      "name": "Ambil Stok Merchant API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-740, -300],
+      "onError": "continueErrorOutput",
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ops.dead_letter(workflow, node, execution_id, business_key, error_message, payload, attempts)\nVALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)\nRETURNING business_key AS merchant_id, error_message;",
+        "options": {
+          "queryReplacement": "={{ ['WF1', 'Ambil Stok Merchant API', $execution.id, $json.merchant_id, $json.error ? ($json.error.message || JSON.stringify($json.error)) : 'request failed', $json, 4] }}"
+        }
+      },
+      "id": "a5-catat-dead-letter",
+      "name": "Catat Dead-Letter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-520, -160],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"ops-alerts\", \"title\": \"Sinkron stok gagal: \" + $json.merchant_id, \"text\": \"Merchant \" + $json.merchant_id + \" gagal setelah retry. Error: \" + $json.error_message } }}",
+        "options": {}
+      },
+      "id": "a6-alert-merchant-gagal",
+      "name": "Alert Merchant Gagal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-300, -160],
+      "continueOnFail": true,
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const entry of $input.all()) {\n  const raw = entry.json;\n  const items = Array.isArray(raw.items) ? raw.items : [];\n  if (items.length === 0) {\n    out.push({ json: { merchant_id: raw.merchant_id, baris_kosong: true } });\n    continue;\n  }\n  for (const it of items) {\n    out.push({\n      json: {\n        merchant_id: raw.merchant_id,\n        sku: String(it.sku).toUpperCase(),\n        qty: parseInt(it.qty, 10) || 0,\n        synced_at: raw.as_of || new Date().toISOString(),\n        baris_kosong: false,\n      },\n    });\n  }\n}\nreturn out;"
+      },
+      "id": "a7-normalisasi-stok",
+      "name": "Normalisasi Stok",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, -440]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "a8-cond-baris",
+              "leftValue": "={{ $json.baris_kosong }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a8-ada-baris-stok",
+      "name": "Ada Baris Stok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-300, -440]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"ops-alerts\", \"title\": \"Sinkron 0 baris: \" + $json.merchant_id, \"text\": \"Merchant \" + $json.merchant_id + \" mengembalikan 0 item - kemungkinan outage diam-diam.\" } }}",
+        "options": {}
+      },
+      "id": "a12-gagal-sinkron-0-baris",
+      "name": "Gagal: Sinkron 0 Baris",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-80, -560],
+      "continueOnFail": true,
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByFields",
+        "fieldsToMatchString": "sku",
+        "joinMode": "keepMatches",
+        "outputDataFrom": "both",
+        "options": {}
+      },
+      "id": "a10-gabungkan-katalog",
+      "name": "Gabungkan Katalog",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [-80, -440]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT $1::text AS merchant_id, $2::text AS product_id, $3::int AS qty_baru, $4::timestamptz AS synced_at, s.qty AS qty_lama\nFROM (SELECT 1) x\nLEFT JOIN core.merchant_stock s ON s.merchant_id = $1 AND s.product_id = $2;",
+        "options": {
+          "queryReplacement": "={{ [$json.merchant_id, $json.product_id, $json.qty, $json.synced_at] }}"
+        }
+      },
+      "id": "a10b-ambil-stok-lama",
+      "name": "Ambil Stok Lama",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [120, -440],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((entry) => {\n  const j = entry.json;\n  const newStockout = j.qty_lama !== null && Number(j.qty_lama) > 0 && Number(j.qty_baru) === 0;\n  return { json: { ...j, new_stockout: newStockout } };\n});"
+      },
+      "id": "a10c-deteksi-stok-habis-baru",
+      "name": "Deteksi Stok Habis Baru",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, -440]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO core.merchant_stock (merchant_id, product_id, qty, synced_at)\nVALUES ($1,$2,$3,$4)\nON CONFLICT (merchant_id, product_id) DO UPDATE SET qty = EXCLUDED.qty, synced_at = EXCLUDED.synced_at\nRETURNING merchant_id, product_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.merchant_id, $json.product_id, $json.qty_baru, $json.synced_at] }}"
+        }
+      },
+      "id": "a11-upsert-stok",
+      "name": "Upsert Stok",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [560, -440],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": { "mode": "append", "numberInputs": 3, "options": {} },
+      "id": "a13-gabung-hasil-merchant",
+      "name": "Gabung Hasil Merchant",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [800, -300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nconst start = sd.sync_start || Date.now();\nconst duration_ms = Date.now() - start;\nreturn [{ json: { duration_ms } }];"
+      },
+      "id": "a14-hitung-durasi",
+      "name": "Hitung Durasi",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1020, -300],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ops.sync_runs (run_at, merchants_total, merchants_ok, rows_synced, new_stockouts, duration_ms)\nSELECT now(),\n (SELECT COUNT(*) FROM core.merchants WHERE active),\n (SELECT COUNT(DISTINCT merchant_id) FROM core.merchant_stock WHERE synced_at >= now() - interval '20 minutes'),\n (SELECT COUNT(*) FROM core.merchant_stock WHERE synced_at >= now() - interval '20 minutes'),\n (SELECT COUNT(*) FROM core.merchant_stock WHERE synced_at >= now() - interval '20 minutes' AND qty = 0),\n $1\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.duration_ms] }}"
+        }
+      },
+      "id": "a15-catat-sync-run",
+      "name": "Catat Sync Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1240, -300],
+      "executeOnce": true,
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "a16-cond-lambat",
+              "leftValue": "={{ $json.duration_ms }}",
+              "rightValue": 60000,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a16-terlalu-lambat",
+      "name": "Terlalu Lambat?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1460, -300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"ops-alerts\", \"title\": \"Sinkron stok lambat\", \"text\": \"Durasi sinkron \" + $json.duration_ms + \"ms melebihi ambang.\" } }}",
+        "options": {}
+      },
+      "id": "a17-alert-perlambatan",
+      "name": "Alert Perlambatan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1460, -480],
+      "continueOnFail": true,
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://uptime-kuma:3001/api/push/ISI_TOKEN_PUSH_KUMA",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "status", "value": "up" },
+            { "name": "msg", "value": "OK" },
+            { "name": "ping", "value": "" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a18-heartbeat-kuma",
+      "name": "Heartbeat Uptime Kuma",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, -300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "a19-cond-habis-baru",
+              "leftValue": "={{ $('Catat Sync Run').item.json.new_stockouts }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a19-ada-produk-habis-baru",
+      "name": "Ada Produk Habis Baru?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1900, -300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"merchant-ops\", \"title\": \"Produk habis baru\", \"text\": $('Catat Sync Run').item.json.new_stockouts + \" baris stok 0 pada sinkron ini.\" } }}",
+        "options": {}
+      },
+      "id": "a20-laporkan-produk-habis",
+      "name": "Laporkan Produk Habis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2120, -300],
+      "continueOnFail": true,
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    },
+
+    {
+      "parameters": {
+        "content": "## WF1 - Jalur B: Order Masuk\n\nKontrak HTTP lengkap: 422 (event tidak valid), 200 duplikat (idempotent terhadap order_id yang sama dikirim dua kali), 409 (stok habis), 200 diterima (cukup/tipis, field `peringatan` muncul bila tipis).\n\n**Kebijakan stok tipis (dokumentasikan di docs/02):** sisa stok setelah order <= 2 unit untuk SKU manapun di order itu -> `peringatan: stok_tipis`, order tetap diterima.",
+        "height": 300,
+        "width": 480
+      },
+      "id": "sb-sticky",
+      "name": "Sticky Note Jalur B",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1400, 140]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "order-created",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b1-webhook-order-created",
+      "name": "Webhook order.created",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1400, 400],
+      "webhookId": "order-created",
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-WEBHOOK", "name": "Header Auth H8Mart Webhook" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "b2-cond-event",
+              "leftValue": "={{ $json.body.event }}",
+              "rightValue": "order.created",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "b2-cond-order-id",
+              "leftValue": "={{ $json.body.order_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            },
+            {
+              "id": "b2-cond-merchant-id",
+              "leftValue": "={{ $json.body.merchant_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            },
+            {
+              "id": "b2-cond-items",
+              "leftValue": "={{ Array.isArray($json.body.items) && $json.body.items.length > 0 }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2-event-valid",
+      "name": "Event Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-1160, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"tidak_valid\" } }}",
+        "options": { "responseCode": 422 }
+      },
+      "id": "b10-respon-422",
+      "name": "Respon 422 Tidak Valid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-1160, 580]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT $1::text AS order_id, EXISTS(SELECT 1 FROM core.orders WHERE order_id = $1) AS sudah_ada;",
+        "options": { "queryReplacement": "={{ [$json.body.order_id] }}" }
+      },
+      "id": "b3-cek-order-duplikat",
+      "name": "Cek Order Duplikat",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-940, 400],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "b4-cond-sudah-ada",
+              "leftValue": "={{ $json.sudah_ada }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b4-order-sudah-ada",
+      "name": "Order Sudah Ada?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-720, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"diterima\", \"duplikat\": true } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "b4a-respon-200-duplikat",
+      "name": "Respon 200 Diterima (Duplikat)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-720, 580]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $('Webhook order.created').item.json.body;\nconst items = Array.isArray(body.items) ? body.items : [];\nreturn items.map((it) => ({\n  json: {\n    order_id: body.order_id,\n    merchant_id: body.merchant_id,\n    customer_id: body.customer_id,\n    total_amount: body.total_amount,\n    customer_note: body.customer_note || null,\n    sku: it.sku,\n    requested_qty: it.qty,\n  },\n}));"
+      },
+      "id": "b5-siapkan-item-order",
+      "name": "Siapkan Item Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-500, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT $3::text AS order_id, $1::text AS merchant_id, $2::text AS sku, $4::int AS requested_qty, p.product_id, COALESCE(ms.qty,0) AS qty_tersedia\nFROM core.products p\nLEFT JOIN core.merchant_stock ms ON ms.product_id = p.product_id AND ms.merchant_id = $1\nWHERE p.sku = $2;",
+        "options": {
+          "queryReplacement": "={{ [$json.merchant_id, $json.sku, $json.order_id, $json.requested_qty] }}"
+        }
+      },
+      "id": "b6-cek-stok-tiap-item",
+      "name": "Cek Stok Tiap Item",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-280, 300],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map((e) => e.json);\nlet habis = false;\nlet tipis = false;\nfor (const r of rows) {\n  const tersedia = Number(r.qty_tersedia);\n  const diminta = Number(r.requested_qty);\n  if (tersedia < diminta) habis = true;\n  else if (tersedia - diminta <= 2) tipis = true;\n}\nconst status = habis ? 'habis' : (tipis ? 'tipis' : 'cukup');\nreturn [{\n  json: {\n    order_id: rows[0] ? rows[0].order_id : null,\n    merchant_id: rows[0] ? rows[0].merchant_id : null,\n    stok_status: status,\n    items: rows,\n  },\n}];"
+      },
+      "id": "b7-evaluasi-stok",
+      "name": "Evaluasi Stok",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-60, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "b8-cond-cukup",
+              "leftValue": "={{ $json.stok_status }}",
+              "rightValue": "habis",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b8-stok-cukup",
+      "name": "Stok Cukup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [160, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"ditolak\", \"alasan\": \"stok_habis\" } }}",
+        "options": { "responseCode": 409 }
+      },
+      "id": "b9hab-respon-409",
+      "name": "Respon 409 Stok Habis",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [160, 480]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO core.orders (order_id, customer_id, merchant_id, zone, order_date, created_at, status, total_amount, payment_status, customer_note)\nVALUES ($1,$2,$3,(SELECT zone FROM core.merchants WHERE merchant_id = $3),CURRENT_DATE,now(),'active',$4,'unpaid',$5)\nON CONFLICT (order_id) DO NOTHING\nRETURNING order_id;",
+        "options": {
+          "queryReplacement": "={{ [$('Webhook order.created').item.json.body.order_id, $('Webhook order.created').item.json.body.customer_id, $('Webhook order.created').item.json.body.merchant_id, $('Webhook order.created').item.json.body.total_amount, $('Webhook order.created').item.json.body.customer_note || ''] }}"
+        }
+      },
+      "id": "b9-catat-order",
+      "name": "Catat Order",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [380, 300],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $('Evaluasi Stok').item.json.items || [];\nconst orderId = $('Evaluasi Stok').item.json.order_id;\nreturn items.map((it) => ({\n  json: {\n    order_id: orderId,\n    product_id: it.product_id,\n    qty: it.requested_qty,\n  },\n}));"
+      },
+      "id": "b10code-siapkan-item-insert",
+      "name": "Siapkan Item Insert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO core.order_items (order_id, product_id, qty, unit_price)\nSELECT $1,$2,$3, price FROM core.products WHERE product_id = $2\nON CONFLICT (order_id, product_id) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [$json.order_id, $json.product_id, $json.qty] }}"
+        }
+      },
+      "id": "b11-catat-order-items",
+      "name": "Catat Order Items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [820, 300],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"diterima\", \"peringatan\": $('Evaluasi Stok').item.json.stok_status === 'tipis' ? 'stok_tipis' : undefined } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "b12-respon-200",
+      "name": "Respon 200 Diterima",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1040, 300]
+    },
+
+    {
+      "parameters": {
+        "content": "## WF1 - Jalur C: Digest Ops 07.00 WIB\n\nAlasan batal teratas dihitung langsung lewat SQL (bukan MCP Client ke WF2) - lebih sederhana dan tidak butuh WF2 Published. Nilai penuh \"lewat MCP Client\": ganti node Hitung KPI Harian dengan panggilan ke WF2 bila ingin mengejar poin itu secara literal.",
+        "height": 200,
+        "width": 480
+      },
+      "id": "sc-sticky",
+      "name": "Sticky Note Jalur C",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1400, 740]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 7 * * *" }
+          ]
+        }
+      },
+      "id": "c1-jadwal-digest",
+      "name": "Jadwal Digest 07.00 WIB",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1400, 960]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n (SELECT hari_data_terakhir FROM core.data_info) AS tanggal,\n COUNT(*)::int AS total_order,\n COUNT(*) FILTER (WHERE status IN ('cancelled','failed'))::int AS order_batal,\n ROUND(COUNT(*) FILTER (WHERE status IN ('cancelled','failed'))::numeric / NULLIF(COUNT(*),0),4)::float AS cancel_rate,\n COUNT(*) FILTER (WHERE status = 'delivered')::int AS order_delivered,\n (SELECT ROUND(COUNT(*) FILTER (WHERE d.actual_minutes <= d.promised_minutes)::numeric / NULLIF(COUNT(*),0),4)::float\n  FROM core.orders o2 JOIN core.deliveries d ON d.order_id = o2.order_id\n  WHERE o2.status = 'delivered' AND o2.order_date = (SELECT hari_data_terakhir FROM core.data_info)) AS sla_30_menit,\n (SELECT json_agg(t) FROM (\n    SELECT cancel_reason, COUNT(*)::int AS jumlah\n    FROM core.orders\n    WHERE order_date = (SELECT hari_data_terakhir FROM core.data_info) AND status IN ('cancelled','failed')\n    GROUP BY cancel_reason ORDER BY jumlah DESC LIMIT 3\n  ) t) AS alasan_batal_teratas\nFROM core.orders\nWHERE order_date = (SELECT hari_data_terakhir FROM core.data_info);"
+      },
+      "id": "c2-hitung-kpi-harian",
+      "name": "Hitung KPI Harian",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-1160, 960],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c3-cond-kosong",
+              "leftValue": "={{ $json.total_order }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c3-digest-kosong",
+      "name": "Digest Kosong?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-940, 960]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"ops-alerts\", \"title\": \"Digest kosong\", \"text\": \"Digest tanggal \" + $json.tanggal + \" tidak ada order - cek sumber data.\" } }}",
+        "options": {}
+      },
+      "id": "c4-gagal-digest-kosong",
+      "name": "Gagal: Digest Kosong",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-940, 1140],
+      "continueOnFail": true,
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\nconst pct = (x) => (x == null ? 'N/A' : (Number(x) * 100).toFixed(1) + '%');\nconst alasan = Array.isArray(d.alasan_batal_teratas) ? d.alasan_batal_teratas : [];\nconst alasanText = alasan.length\n  ? alasan.map((a, i) => `${i + 1}. ${a.cancel_reason} (${a.jumlah}x)`).join('\\n')\n  : '-';\nconst pesan = `*Digest Ops H8Mart - ${d.tanggal}*\\n\\nTotal order: ${d.total_order}\\nOrder batal: ${d.order_batal} (${pct(d.cancel_rate)})\\nSLA 30 menit: ${pct(d.sla_30_menit)}\\n\\nAlasan batal teratas:\\n${alasanText}`;\nreturn [{ json: { pesan, tanggal: d.tanggal, total_order: d.total_order } }];"
+      },
+      "id": "c6-susun-teks-digest",
+      "name": "Susun Teks Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-720, 960]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "GANTI-CHAT-ID-OPS",
+        "text": "={{ $json.pesan }}",
+        "additionalFields": { "parse_mode": "Markdown", "appendAttribution": false }
+      },
+      "id": "c7-kirim-digest-telegram",
+      "name": "Kirim Digest Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [-500, 960],
+      "credentials": { "telegramApi": { "id": "GANTI-ID-TELEGRAM", "name": "Telegram H8Mart Ops" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"ops-digest\", \"title\": \"Digest Ops \" + $('Susun Teks Digest').item.json.tanggal, \"text\": $('Susun Teks Digest').item.json.pesan } }}",
+        "options": {}
+      },
+      "id": "c8-kirim-digest-notification",
+      "name": "Kirim Digest Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-280, 960],
+      "continueOnFail": true,
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
+    }
+  ],
+  "connections": {
+    "Jadwal Sinkron 15 Menit": {
+      "main": [
+        [
+          { "node": "Catat Waktu Mulai", "type": "main", "index": 0 },
+          { "node": "Ambil Katalog Produk", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Catat Waktu Mulai": { "main": [[{ "node": "Ambil Daftar Merchant", "type": "main", "index": 0 }]] },
+    "Ambil Daftar Merchant": { "main": [[{ "node": "Ambil Stok Merchant API", "type": "main", "index": 0 }]] },
+    "Ambil Stok Merchant API": {
+      "main": [
+        [{ "node": "Normalisasi Stok", "type": "main", "index": 0 }],
+        [{ "node": "Catat Dead-Letter", "type": "main", "index": 0 }]
+      ]
+    },
+    "Catat Dead-Letter": { "main": [[{ "node": "Alert Merchant Gagal", "type": "main", "index": 0 }]] },
+    "Alert Merchant Gagal": { "main": [[{ "node": "Gabung Hasil Merchant", "type": "main", "index": 0 }]] },
+    "Normalisasi Stok": { "main": [[{ "node": "Ada Baris Stok?", "type": "main", "index": 0 }]] },
+    "Ada Baris Stok?": {
+      "main": [
+        [{ "node": "Gabungkan Katalog", "type": "main", "index": 0 }],
+        [{ "node": "Gagal: Sinkron 0 Baris", "type": "main", "index": 0 }]
+      ]
+    },
+    "Gagal: Sinkron 0 Baris": { "main": [[{ "node": "Gabung Hasil Merchant", "type": "main", "index": 1 }]] },
+    "Ambil Katalog Produk": { "main": [[{ "node": "Gabungkan Katalog", "type": "main", "index": 1 }]] },
+    "Gabungkan Katalog": { "main": [[{ "node": "Ambil Stok Lama", "type": "main", "index": 0 }]] },
+    "Ambil Stok Lama": { "main": [[{ "node": "Deteksi Stok Habis Baru", "type": "main", "index": 0 }]] },
+    "Deteksi Stok Habis Baru": { "main": [[{ "node": "Upsert Stok", "type": "main", "index": 0 }]] },
+    "Upsert Stok": { "main": [[{ "node": "Gabung Hasil Merchant", "type": "main", "index": 2 }]] },
+    "Gabung Hasil Merchant": { "main": [[{ "node": "Hitung Durasi", "type": "main", "index": 0 }]] },
+    "Hitung Durasi": { "main": [[{ "node": "Catat Sync Run", "type": "main", "index": 0 }]] },
+    "Catat Sync Run": { "main": [[{ "node": "Terlalu Lambat?", "type": "main", "index": 0 }]] },
+    "Terlalu Lambat?": {
+      "main": [
+        [{ "node": "Alert Perlambatan", "type": "main", "index": 0 }],
+        [{ "node": "Heartbeat Uptime Kuma", "type": "main", "index": 0 }]
+      ]
+    },
+    "Alert Perlambatan": { "main": [[{ "node": "Heartbeat Uptime Kuma", "type": "main", "index": 0 }]] },
+    "Heartbeat Uptime Kuma": { "main": [[{ "node": "Ada Produk Habis Baru?", "type": "main", "index": 0 }]] },
+    "Ada Produk Habis Baru?": { "main": [[{ "node": "Laporkan Produk Habis", "type": "main", "index": 0 }]] },
+
+    "Webhook order.created": { "main": [[{ "node": "Event Valid?", "type": "main", "index": 0 }]] },
+    "Event Valid?": {
+      "main": [
+        [{ "node": "Cek Order Duplikat", "type": "main", "index": 0 }],
+        [{ "node": "Respon 422 Tidak Valid", "type": "main", "index": 0 }]
+      ]
+    },
+    "Cek Order Duplikat": { "main": [[{ "node": "Order Sudah Ada?", "type": "main", "index": 0 }]] },
+    "Order Sudah Ada?": {
+      "main": [
+        [{ "node": "Respon 200 Diterima (Duplikat)", "type": "main", "index": 0 }],
+        [{ "node": "Siapkan Item Order", "type": "main", "index": 0 }]
+      ]
+    },
+    "Siapkan Item Order": { "main": [[{ "node": "Cek Stok Tiap Item", "type": "main", "index": 0 }]] },
+    "Cek Stok Tiap Item": { "main": [[{ "node": "Evaluasi Stok", "type": "main", "index": 0 }]] },
+    "Evaluasi Stok": { "main": [[{ "node": "Stok Cukup?", "type": "main", "index": 0 }]] },
+    "Stok Cukup?": {
+      "main": [
+        [{ "node": "Catat Order", "type": "main", "index": 0 }],
+        [{ "node": "Respon 409 Stok Habis", "type": "main", "index": 0 }]
+      ]
+    },
+    "Catat Order": { "main": [[{ "node": "Siapkan Item Insert", "type": "main", "index": 0 }]] },
+    "Siapkan Item Insert": { "main": [[{ "node": "Catat Order Items", "type": "main", "index": 0 }]] },
+    "Catat Order Items": { "main": [[{ "node": "Respon 200 Diterima", "type": "main", "index": 0 }]] },
+
+    "Jadwal Digest 07.00 WIB": { "main": [[{ "node": "Hitung KPI Harian", "type": "main", "index": 0 }]] },
+    "Hitung KPI Harian": { "main": [[{ "node": "Digest Kosong?", "type": "main", "index": 0 }]] },
+    "Digest Kosong?": {
+      "main": [
+        [{ "node": "Gagal: Digest Kosong", "type": "main", "index": 0 }],
+        [{ "node": "Susun Teks Digest", "type": "main", "index": 0 }]
+      ]
+    },
+    "Susun Teks Digest": { "main": [[{ "node": "Kirim Digest Telegram", "type": "main", "index": 0 }]] },
+    "Kirim Digest Telegram": { "main": [[{ "node": "Kirim Digest Notification", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "meta": {
+    "instanceId": "h8mart-ops-starter"
+  },
+  "tags": []
+}

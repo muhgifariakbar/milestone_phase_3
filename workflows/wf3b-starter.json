@@ -1,0 +1,129 @@
+{
+  "name": "WF3b - Chat Asisten Telegram",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WF3b - Chat asisten lewat Telegram (nilai penuh)\n\nMeneruskan pertanyaan ke Webhook WF3 (logika agent tetap satu tempat). Allowlist chat_id -> merchant_id dari `ops.telegram_merchants` (diisi manual, lihat SETUP.md 5b).\n\n**Wajib HTTPS** (Telegram Trigger butuh webhook publik). Di laptop, workflow ini bisa diimpor tapi Trigger tidak akan menerima update sampai instance HTTPS hidup.\n\n**TODO:**\n- [ ] Isi `ops.telegram_merchants` dengan chat_id kalian sendiri\n- [ ] Ganti URL HTTP Request ke domain HTTPS kalian setelah deploy (saat ini memakai nama service internal `n8n:5678`, hanya benar bila dipanggil dari dalam docker network yang sama)\n- [ ] Publish workflow ini (Telegram Trigger mendaftarkan webhook ke bot - 1 bot hanya 1 webhook aktif)",
+        "height": 340,
+        "width": 560
+      },
+      "id": "w3b-sticky",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-700, -340]
+    },
+    {
+      "parameters": { "updates": ["message"] },
+      "id": "tt1-telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [-700, 0],
+      "webhookId": "telegram-chat-asisten",
+      "credentials": { "telegramApi": { "id": "GANTI-ID-TELEGRAM", "name": "Telegram H8Mart Ops" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT $1::bigint AS chat_id, merchant_id FROM ops.telegram_merchants WHERE chat_id = $1;",
+        "options": { "queryReplacement": "={{ [$json.message.chat.id] }}" }
+      },
+      "id": "tc1-cek-allowlist",
+      "name": "Cek Allowlist",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-480, 0],
+      "credentials": { "postgres": { "id": "GANTI-ID-PG-MCP-READER", "name": "Postgres mcp_reader" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "ta1-cond-terdaftar",
+              "leftValue": "={{ $json.merchant_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ta1-chat-terdaftar",
+      "name": "Chat Terdaftar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-260, 0]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "Maaf, chat ini belum terdaftar sebagai merchant H8Mart. Hubungi tim Ops untuk didaftarkan.",
+        "additionalFields": {}
+      },
+      "id": "tx1-balas-chat-asing",
+      "name": "Balas Chat Asing",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [-40, 140],
+      "credentials": { "telegramApi": { "id": "GANTI-ID-TELEGRAM", "name": "Telegram H8Mart Ops" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n:5678/webhook/merchant-question",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"merchant_id\": $json.merchant_id, \"question\": $('Telegram Trigger').item.json.message.text } }}",
+        "options": {}
+      },
+      "id": "tq1-tanya-asisten-wf3",
+      "name": "Tanya Asisten WF3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-40, -80],
+      "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-WEBHOOK", "name": "Header Auth H8Mart Webhook" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.jawaban }}",
+        "additionalFields": {}
+      },
+      "id": "tb1-kirim-jawaban",
+      "name": "Kirim Jawaban ke Chat",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [180, -80],
+      "credentials": { "telegramApi": { "id": "GANTI-ID-TELEGRAM", "name": "Telegram H8Mart Ops" } }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": { "main": [[{ "node": "Cek Allowlist", "type": "main", "index": 0 }]] },
+    "Cek Allowlist": { "main": [[{ "node": "Chat Terdaftar?", "type": "main", "index": 0 }]] },
+    "Chat Terdaftar?": {
+      "main": [
+        [{ "node": "Tanya Asisten WF3", "type": "main", "index": 0 }],
+        [{ "node": "Balas Chat Asing", "type": "main", "index": 0 }]
+      ]
+    },
+    "Tanya Asisten WF3": { "main": [[{ "node": "Kirim Jawaban ke Chat", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "h8mart-ops-starter"
+  },
+  "tags": []
+}

@@ -1,0 +1,173 @@
+{
+  "name": "WF5 - Reliability dan Monitoring",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "e1-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Error Trigger memberi { execution, workflow, trigger } dari eksekusi yang gagal.\nconst err = $input.first().json;\n\nconst workflowName = err.workflow && err.workflow.name ? err.workflow.name : 'Unknown workflow';\nconst nodeName = (err.execution && err.execution.error && err.execution.error.node && err.execution.error.node.name)\n  || (err.execution && err.execution.lastNodeExecuted)\n  || 'Unknown node';\nconst waktu = new Date().toISOString();\nconst errorMessage = (err.execution && err.execution.error && err.execution.error.message) || 'unknown error';\n\n// Business key: cari order_id (HM-...) atau merchant_id (M0xx) di pesan error atau payload node yang gagal.\nconst haystack = JSON.stringify(err.execution && err.execution.error ? err.execution.error : {});\nconst orderMatch = haystack.match(/HM-[A-Z0-9-]+/);\nconst merchantMatch = haystack.match(/\\bM0\\d{2}\\b/);\nconst businessKey = (orderMatch && orderMatch[0]) || (merchantMatch && merchantMatch[0]) || 'N/A';\n\nconst pesan = `\\u26a0\\ufe0f *Alert H8Mart Ops*\\nWorkflow: ${workflowName}\\nNode: ${nodeName}\\nWaktu: ${waktu}\\nBusiness key: ${businessKey}\\nError: ${errorMessage}`;\n\nreturn [{ json: { pesan, workflowName, nodeName, waktu, businessKey, errorMessage } }];"
+      },
+      "id": "e2-susun-pesan-alert",
+      "name": "Susun Pesan Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "e2b-cond-wf1-sinkron",
+              "leftValue": "={{ $json.workflowName }}",
+              "rightValue": "WF1",
+              "operator": { "type": "string", "operation": "contains" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e2b-asal-wf1-sinkron",
+      "name": "Dari WF1 Sinkron?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [540, 460]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://uptime-kuma:3001/api/push/ISI_TOKEN_PUSH_KUMA",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "status", "value": "down" },
+            { "name": "msg", "value": "={{ $json.errorMessage }}" },
+            { "name": "ping", "value": "" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e2c-heartbeat-kuma-down",
+      "name": "Heartbeat Kuma Down",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [760, 460],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "GANTI-CHAT-ID-OPS",
+        "text": "={{ $('Susun Pesan Alert').item.json.pesan }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "e3-kirim-alert-telegram",
+      "name": "Kirim Alert Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [680, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "GANTI-ID-TELEGRAM",
+          "name": "Telegram H8Mart Ops"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://mock-api:8080/notify",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"channel\": \"ops-alerts\", \"title\": \"Alert: \" + $('Susun Pesan Alert').item.json.workflowName, \"text\": $('Susun Pesan Alert').item.json.pesan } }}",
+        "options": {}
+      },
+      "id": "e4-kirim-alert-notification",
+      "name": "Kirim Alert Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GANTI-ID-HEADER-AUTH-MOCK-API",
+          "name": "Header Auth Mock API (X-Api-Key)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## WF5 - Error Workflow pusat\n\n**Cara pakai:** di WF1-WF4, buka Settings > Error Workflow, pilih workflow ini.\n\n**Minimum (lihat guide/wf5-reliability-monitoring.md):**\n- Error Trigger di sini menangkap kegagalan dari WF1-WF4 (setelah Retry On Fail habis, atau Stop and Error).\n- Pesan alert wajib berisi: workflow, node, waktu, business key (order_id / merchant_id).\n- Mekanisme lain (dead-letter `ops.dead_letter`, heartbeat Uptime Kuma, deteksi sinkron 0 baris / digest kosong, alert ambang durasi) dipasang di WF1 Jalur A/C dan WF4, bukan di sini - tapi harus berakhir mengirim alert yang sama ke Telegram.\n\n**Heartbeat Kuma Down:** bila error berasal dari WF1 Sinkron (nama workflow mengandung \"WF1\"), kirim push Down ke Uptime Kuma sebelum alert Telegram - pasangannya (push Up) ada di WF1 Jalur A setelah sinkron sukses.\n\n**TODO sebelum submit:**\n- [ ] Ganti `GANTI-CHAT-ID-OPS` dengan chat_id Ops kalian (lihat SETUP.md 5b)\n- [ ] Ganti `ISI_TOKEN_PUSH_KUMA` di URL Heartbeat Kuma Down dengan token monitor Push kalian (data-contract.md bagian 7)\n- [ ] Pilih credential Telegram API dan Header Auth Mock API di masing-masing node\n- [ ] Uji: picu error sengaja di WF1 (mis. matikan mock-api) dan pastikan alert masuk ke Telegram + Executions tercatat\n- [ ] Simpan bukti di evidence/wf5/",
+        "height": 420,
+        "width": 420
+      },
+      "id": "e5-sticky-note",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [240, -220]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          { "node": "Susun Pesan Alert", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Susun Pesan Alert": {
+      "main": [
+        [
+          { "node": "Dari WF1 Sinkron?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Dari WF1 Sinkron?": {
+      "main": [
+        [
+          { "node": "Heartbeat Kuma Down", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Kirim Alert Telegram", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Heartbeat Kuma Down": {
+      "main": [
+        [
+          { "node": "Kirim Alert Telegram", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Kirim Alert Telegram": {
+      "main": [
+        [
+          { "node": "Kirim Alert Notification", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "h8mart-ops-starter"
+  },
+  "tags": []
+}
