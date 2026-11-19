@@ -62,20 +62,29 @@
       "credentials": { "postgres": { "id": "GANTI-ID-PG-OPS-WRITER", "name": "Postgres ops_writer" } }
     },
     {
+      "parameters": { "batchSize": 1, "options": {} },
+      "id": "a2l-loop-per-merchant",
+      "name": "Loop Per Merchant",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-850, -300]
+    },
+    {
       "parameters": {
         "method": "GET",
         "url": "={{ 'http://mock-api:8080/merchants/' + $json.merchant_id + '/stock' }}",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
-        "options": {
-          "retry": { "retryOnFail": true, "maxTries": 4, "waitBetweenTries": 1000 }
-        }
+        "options": {}
       },
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 1000,
       "id": "a3h-ambil-stok-merchant-api",
       "name": "Ambil Stok Merchant API",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [-740, -300],
+      "position": [-640, -300],
       "onError": "continueErrorOutput",
       "credentials": { "httpHeaderAuth": { "id": "GANTI-ID-HEADER-AUTH-MOCK-API", "name": "Header Auth Mock API (X-Api-Key)" } }
     },
@@ -115,7 +124,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const out = [];\nfor (const entry of $input.all()) {\n  const raw = entry.json;\n  const items = Array.isArray(raw.items) ? raw.items : [];\n  if (items.length === 0) {\n    out.push({ json: { merchant_id: raw.merchant_id, baris_kosong: true } });\n    continue;\n  }\n  for (const it of items) {\n    out.push({\n      json: {\n        merchant_id: raw.merchant_id,\n        sku: String(it.sku).toUpperCase(),\n        qty: parseInt(it.qty, 10) || 0,\n        synced_at: raw.as_of || new Date().toISOString(),\n        baris_kosong: false,\n      },\n    });\n  }\n}\nreturn out;"
+        "jsCode": "const out = [];\nfor (const entry of $input.all()) {\n  const raw = entry.json;\n  if (!Array.isArray(raw.items)) continue; // respons Alert Merchant Gagal ikut kembali lewat loop, bukan data stok\n  const items = raw.items;\n  if (items.length === 0) {\n    out.push({ json: { merchant_id: raw.merchant_id, baris_kosong: true } });\n    continue;\n  }\n  for (const it of items) {\n    out.push({\n      json: {\n        merchant_id: raw.merchant_id,\n        sku: String(it.sku).toUpperCase(),\n        qty: parseInt(it.qty, 10) || 0,\n        synced_at: raw.as_of || new Date().toISOString(),\n        baris_kosong: false,\n      },\n    });\n  }\n}\nreturn out;"
       },
       "id": "a7-normalisasi-stok",
       "name": "Normalisasi Stok",
@@ -741,15 +750,26 @@
       ]
     },
     "Catat Waktu Mulai": { "main": [[{ "node": "Ambil Daftar Merchant", "type": "main", "index": 0 }]] },
-    "Ambil Daftar Merchant": { "main": [[{ "node": "Ambil Stok Merchant API", "type": "main", "index": 0 }]] },
-    "Ambil Stok Merchant API": {
+    "Ambil Daftar Merchant": { "main": [[{ "node": "Loop Per Merchant", "type": "main", "index": 0 }]] },
+    "Loop Per Merchant": {
       "main": [
         [{ "node": "Normalisasi Stok", "type": "main", "index": 0 }],
+        [{ "node": "Ambil Stok Merchant API", "type": "main", "index": 0 }]
+      ]
+    },
+    "Ambil Stok Merchant API": {
+      "main": [
+        [{ "node": "Loop Per Merchant", "type": "main", "index": 0 }],
         [{ "node": "Catat Dead-Letter", "type": "main", "index": 0 }]
       ]
     },
     "Catat Dead-Letter": { "main": [[{ "node": "Alert Merchant Gagal", "type": "main", "index": 0 }]] },
-    "Alert Merchant Gagal": { "main": [[{ "node": "Gabung Hasil Merchant", "type": "main", "index": 0 }]] },
+    "Alert Merchant Gagal": {
+      "main": [[
+        { "node": "Gabung Hasil Merchant", "type": "main", "index": 0 },
+        { "node": "Loop Per Merchant", "type": "main", "index": 0 }
+      ]]
+    },
     "Normalisasi Stok": { "main": [[{ "node": "Ada Baris Stok?", "type": "main", "index": 0 }]] },
     "Ada Baris Stok?": {
       "main": [
@@ -817,6 +837,7 @@
   "active": false,
   "settings": {
     "executionOrder": "v1",
+    "errorWorkflow": "GANTI-ID-WF5",
     "timezone": "Asia/Jakarta"
   },
   "meta": {

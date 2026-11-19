@@ -546,7 +546,8 @@
   },
   "active": false,
   "settings": {
-    "executionOrder": "v1"
+    "executionOrder": "v1",
+    "errorWorkflow": "GANTI-ID-WF5"
   },
   "meta": {
     "instanceId": "h8mart-ops-starter"
