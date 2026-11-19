@@ -1,0 +1,6 @@
+# Temporary local override for ngrok testing (Telegram HTTPS button flow).
+# Delete this file when done with ngrok testing - compose.yaml's localhost default will apply again.
+services:
+  n8n:
+    environment:
+      - N8N_WEBHOOK_URL=https://f5a5-2404-8000-1048-1f4-ed59-fd53-5f34-1f41.ngrok-free.app/
